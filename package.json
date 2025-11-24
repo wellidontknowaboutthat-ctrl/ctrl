@@ -1,1 +1,12 @@
+{
+  "name": "reserve-governance-watcher",
+  "version": "1.0.0",
+  "main": "watcher.js",
+  "type": "module",
+  "dependencies": {
+    "ethers": "^6.9.1",
+    "node-fetch": "^3.3.2",
+    "ws": "^8.13.0"
+  }
+}
 
