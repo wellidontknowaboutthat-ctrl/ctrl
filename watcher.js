@@ -1,21 +1,32 @@
 // Reserve Governance → Telegram Alerts (Render Worker)
-// Upgraded: voting start, voting end, proposal executed
+// Upgraded with UK timestamps + voting start/end/executed alerts
 
 import { ethers } from "ethers";
 import fetch from "node-fetch";
 
 // --- CONFIG (Render Environment Variables) --- //
 const RPC_WSS = process.env.RPC_WSS;
-const GOVERNANCE = "0xed9cd49bd29f43a6cb74f780ba3aef0fbf1a8a2a"; // Gov module
+const GOVERNANCE = "0xed9cd49bd29f43a6cb74f780ba3aef0fbf1a8a2a";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-// -------------------------------------------- //
+
+// Convert Unix timestamp or now() into UK time
+function ukTime(date = new Date()) {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(date);
+}
+
+console.log("Connecting to Base RPC via WebSocket…");
 
 const provider = new ethers.WebSocketProvider(RPC_WSS);
 
-// Events we listen to.
-// ProposalCreated already confirmed working on your gov.
-// ProposalExecuted is standard OZ Governor; if Reserve emits it, you'll get alerts.
 const ABI = [
   "event ProposalCreated(uint256 proposalId, address proposer, address target, bytes data, uint256 start, uint256 end, string description)",
   "event ProposalExecuted(uint256 proposalId)"
@@ -23,10 +34,10 @@ const ABI = [
 
 const gov = new ethers.Contract(GOVERNANCE, ABI, provider);
 
-// In-memory tracking to avoid duplicate alerts
-const tracked = new Map(); 
-// proposalId -> { startBlock, endBlock, startedSent, endedSent }
+// Track proposals to avoid repeat alerts
+const tracked = new Map();
 
+// Send Telegram message
 async function sendTelegram(text) {
   try {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -44,6 +55,7 @@ async function sendTelegram(text) {
   }
 }
 
+// Poll blocks to detect voting start/end
 function startVoteWatchers(proposalId, startBlock, endBlock, desc) {
   const idStr = proposalId.toString();
 
@@ -57,69 +69,79 @@ function startVoteWatchers(proposalId, startBlock, endBlock, desc) {
     });
   }
 
-  // Poll blocks every 30s to detect start/end
   const interval = setInterval(async () => {
     try {
-      const currentBlock = await provider.getBlockNumber();
+      const block = await provider.getBlockNumber();
       const t = tracked.get(idStr);
       if (!t) return;
 
-      // Voting started
-      if (!t.startedSent && currentBlock >= t.startBlock) {
+      // Voting Started
+      if (!t.startedSent && block >= t.startBlock) {
         t.startedSent = true;
         tracked.set(idStr, t);
 
         await sendTelegram(
-          `✅ *Voting Started*\n\n*Proposal ID:* ${idStr}\n*Start block:* ${t.startBlock}\n\n*Description:*\n${t.desc}`
+          `✅ *Voting Started*  
+*Proposal ID:* ${idStr}  
+*Block:* ${t.startBlock}  
+*Time:* ${ukTime()} (UK Time)
+
+*Description:*  
+${t.desc}`
         );
       }
 
-      // Voting ended
-      if (!t.endedSent && currentBlock >= t.endBlock) {
+      // Voting Ended
+      if (!t.endedSent && block >= t.endBlock) {
         t.endedSent = true;
         tracked.set(idStr, t);
 
         await sendTelegram(
-          `🛑 *Voting Ended*\n\n*Proposal ID:* ${idStr}\n*End block:* ${t.endBlock}\n\n*Description:*\n${t.desc}`
+          `🛑 *Voting Ended*  
+*Proposal ID:* ${idStr}  
+*Block:* ${t.endBlock}  
+*Time:* ${ukTime()} (UK Time)
+
+*Description:*  
+${t.desc}`
         );
 
-        // stop polling for this proposal once ended
         clearInterval(interval);
       }
     } catch (err) {
       console.error("Polling error:", err);
     }
-  }, 30_000);
+  }, 30_000); // check every 30 seconds
 }
 
-// --- LISTENERS --- //
-
-// New proposal created → send alert + schedule vote start/end alerts
+// On Proposal Created
 gov.on("ProposalCreated", async (id, proposer, target, data, start, end, desc) => {
-  const msg = `🗳 *New Proposal Created in SSR DTF*
+  const msg = `🗳 *New Proposal Created*  
+*Proposal ID:* ${id.toString()}  
+*Proposer:* \`${proposer}\`  
+*Target:* \`${target}\`  
+*Start Block:* ${start.toString()}  
+*End Block:* ${end.toString()}  
+*Time Created:* ${ukTime()} (UK Time)
 
-*Proposal ID:* ${id.toString()}
-*Proposer:* \`${proposer}\`
-*Target:* \`${target}\`
-*Start block:* ${start.toString()}
-*End block:* ${end.toString()}
-
-*Description:*
+*Description:*  
 ${desc}`;
 
   console.log(`[SSR] ProposalCreated → ${id.toString()}`);
   await sendTelegram(msg);
 
-  // schedule voting start / end alerts
   startVoteWatchers(id, start, end, desc);
 });
 
-// Proposal executed (if contract emits OZ standard event)
+// On Proposal Executed
 gov.on("ProposalExecuted", async (id) => {
   console.log(`[SSR] ProposalExecuted → ${id.toString()}`);
+
   await sendTelegram(
-    `🎉 *Proposal Executed*\n\n*Proposal ID:* ${id.toString()}`
+    `🎉 *Proposal Executed*  
+*Proposal ID:* ${id.toString()}  
+*Time:* ${ukTime()} (UK Time)`
   );
 });
 
-console.log("Watcher running (proposal create/start/end/execute alerts enabled)...");
+console.log("Watcher running (with UK timestamps + voting start/end/executed alerts)...");
