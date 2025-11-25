@@ -4,9 +4,13 @@ import TelegramBot from "node-telegram-bot-api";
 // ---------------- CONFIG -----------------
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;      
-const THREAD_ID = process.env.THREAD_ID;  
+const CHAT_ID = process.env.CHAT_ID;      // -1002852935546
+const THREAD_ID = process.env.THREAD_ID;  // 3710
 const RPC_WSS = process.env.RPC_WSS;
+
+// Websocket provider (Alchemy) for LIVE events
+// HTTP provider (public Base RPC) for HISTORICAL backfill
+const HTTP_RPC = "https://mainnet.base.org";
 
 const GOVERNANCE = "0x90d1f8317911617d0a6683927149b6493b881fba";
 
@@ -39,64 +43,69 @@ async function send(msg) {
       parse_mode: "Markdown",
     });
   } catch (err) {
-    console.error("Telegram error:", err);
+    console.error("Telegram error:", err?.message || err);
   }
 }
 
-// ---------------- SAFE CATCH-UP (LAST 8 BLOCKS) -----------------
+// ---------------- HISTORICAL BACKFILL (HTTP RPC) -----------------
 
-async function catchUp(gov, provider) {
-  console.log("Running catch-up...");
+async function backfill(govHttp, httpProvider) {
+  console.log("Running historical backfill (HTTP RPC)…");
 
-  const latest = await provider.getBlockNumber();
-  const from = Math.max(latest - 8, 0);
+  // Start a bit before first known proposal block to be safe
+  const START_BLOCK = 38600000;
+  const CHUNK_SIZE = 50000;
 
-  console.log(`Querying logs from block ${from} to ${latest}`);
+  const latest = await httpProvider.getBlockNumber();
+  console.log(`Backfill from block ${START_BLOCK} to ${latest} in chunks of ${CHUNK_SIZE}…`);
 
-  let logs = [];
-  try {
-    logs = await gov.queryFilter(gov.filters.ProposalCreated(), from, latest);
-  } catch (err) {
-    console.error("Catch-up error:", err.message);
-    return;
-  }
-
+  const filter = govHttp.filters.ProposalCreated();
   const now = Math.floor(Date.now() / 1000);
 
-  for (const l of logs) {
-    const { proposalId, voteStart, voteEnd, description } = l.args;
-    const id = proposalId.toString();
+  for (let from = START_BLOCK; from <= latest; from += CHUNK_SIZE) {
+    const to = Math.min(from + CHUNK_SIZE - 1, latest);
+    console.log(`Backfill chunk: ${from} → ${to}`);
 
-    // CREATED
-    if (!sent.created.has(id)) {
-      sent.created.add(id);
-      await send(
-        `📢 *Proposal Created*\n🆔 ${id}\n📝 ${description}\n📅 Starts: ${ts(
-          voteStart
-        )}\n📅 Ends: ${ts(voteEnd)}`
-      );
+    let logs = [];
+    try {
+      logs = await govHttp.queryFilter(filter, from, to);
+    } catch (err) {
+      console.error(`Backfill query error for [${from}, ${to}]:`, err?.message || err);
+      continue;
     }
 
-    // STARTED
-    if (now >= voteStart && now < voteEnd && !sent.start.has(id)) {
-      sent.start.add(id);
-      await send(`🟢 *Voting Started*\n🆔 ${id}\n⏰ ${ts(voteStart)}`);
-    }
+    for (const l of logs) {
+      const { proposalId, voteStart, voteEnd, description } = l.args;
+      const id = proposalId.toString();
 
-    // ENDED
-    if (now >= voteEnd && !sent.end.has(id)) {
-      sent.end.add(id);
-      await send(`🔴 *Voting Ended*\n🆔 ${id}\n⏰ ${ts(voteEnd)}`);
+      if (!sent.created.has(id)) {
+        sent.created.add(id);
+        await send(
+          `📢 *Proposal Created (backfill)*\n🆔 ${id}\n📝 ${description}\n📅 Starts: ${ts(
+            voteStart
+          )}\n📅 Ends: ${ts(voteEnd)}`
+        );
+      }
+
+      if (now >= voteStart && now < voteEnd && !sent.start.has(id)) {
+        sent.start.add(id);
+        await send(`🟢 *Voting Started (backfill)*\n🆔 ${id}\n⏰ ${ts(voteStart)}`);
+      }
+
+      if (now >= voteEnd && !sent.end.has(id)) {
+        sent.end.add(id);
+        await send(`🔴 *Voting Ended (backfill)*\n🆔 ${id}\n⏰ ${ts(voteEnd)}`);
+      }
     }
   }
 
-  console.log("Catch-up complete.");
+  console.log("Historical backfill complete.");
 }
 
-// ---------------- LIVE LISTENERS -----------------
+// ---------------- LIVE LISTENERS (WEBSOCKET) -----------------
 
-function attachListeners(gov) {
-  gov.on(
+function attachListeners(govWs) {
+  govWs.on(
     "ProposalCreated",
     async (
       proposalId,
@@ -120,7 +129,6 @@ function attachListeners(gov) {
         )}\n📅 Ends: ${ts(voteEnd)}`
       );
 
-      // schedule voting start
       const delayStart = voteStart * 1000 - Date.now();
       if (delayStart > 0) {
         setTimeout(async () => {
@@ -131,7 +139,6 @@ function attachListeners(gov) {
         }, delayStart);
       }
 
-      // schedule voting end
       const delayEnd = voteEnd * 1000 - Date.now();
       if (delayEnd > 0) {
         setTimeout(async () => {
@@ -144,7 +151,7 @@ function attachListeners(gov) {
     }
   );
 
-  gov.on("ProposalExecuted", async (proposalId) => {
+  govWs.on("ProposalExecuted", async (proposalId) => {
     const id = proposalId.toString();
     if (sent.executed.has(id)) return;
 
@@ -156,17 +163,23 @@ function attachListeners(gov) {
 // ---------------- MAIN -----------------
 
 async function start() {
-  console.log("Connecting to Base RPC via WebSocket…");
+  console.log("Connecting WebSocket provider (Alchemy) for live events…");
+  const wsProvider = new ethers.WebSocketProvider(RPC_WSS);
+  const govWs = new ethers.Contract(GOVERNANCE, ABI, wsProvider);
 
-  const provider = new ethers.WebSocketProvider(RPC_WSS);
-  const gov = new ethers.Contract(GOVERNANCE, ABI, provider);
+  console.log("Connecting HTTP provider (public Base RPC) for backfill…");
+  const httpProvider = new ethers.JsonRpcProvider(HTTP_RPC);
+  const govHttp = new ethers.Contract(GOVERNANCE, ABI, httpProvider);
 
-  await send("🟦 Bot started (topic enabled + safe catch-up)…");
+  await send("🟦 Bot started (historical backfill + live alerts)…");
 
-  await catchUp(gov, provider);
-  attachListeners(gov);
+  // 1) Backfill historical proposals via HTTP
+  await backfill(govHttp, httpProvider);
 
-  console.log("Watcher running...");
+  // 2) Attach live listeners via WebSocket
+  attachListeners(govWs);
+
+  console.log("Watcher running (backfill done, live listeners active)…");
 }
 
 start().catch((err) => {
