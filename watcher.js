@@ -1,23 +1,24 @@
-// Reserve Governance → Telegram Alerts (Render Worker)
-// Topic-enabled version (all alerts go to BASE DTF ALERTS topic)
+// Reserve Governance Watcher (Topic + UK Timestamps + Reconnect + Full Alerts)
+// Compatible with ETHERS v6.x
 
-// --------------------------------------------------------
-// CONFIG (from Render Environment Variables)
-// --------------------------------------------------------
 import { ethers } from "ethers";
 import fetch from "node-fetch";
 
+// ------------------------------
+// CONFIG (from Render ENV)
+// ------------------------------
 const RPC_WSS = process.env.RPC_WSS;
-const GOVERNANCE = "0xed9cd49bd29f43a6cb74f780ba3aef0fbf1a8a2a"; 
+const GOVERNANCE = "0xed9cd49bd29f43a6cb74f780ba3aef0fbf1a8a2a";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-// Topic ID for "BASE DTF ALERTS"
-const TOPIC_ID = 3710;  // <== ALWAYS SEND INTO THIS TOPIC
+// Topic ID where all messages should be sent
+// This is your "BASE DTF ALERTS" topic
+const TOPIC_ID = 3710;
 
-// --------------------------------------------------------
-// UK Timestamp Utility
-// --------------------------------------------------------
+// ------------------------------
+// UK TIMESTAMP UTILITY
+// ------------------------------
 function ukTime(date = new Date()) {
   return new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/London",
@@ -26,51 +27,52 @@ function ukTime(date = new Date()) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit"
+    second: "2-digit",
   }).format(date);
 }
 
-// --------------------------------------------------------
-// Telegram Sender (Topic-Aware)
-// --------------------------------------------------------
+// ------------------------------
+// TELEGRAM SEND (TOPIC AWARE)
+// ------------------------------
 async function sendTelegram(text) {
   const payload = {
     chat_id: CHAT_ID,
+    message_thread_id: TOPIC_ID,
     text,
     parse_mode: "Markdown",
     disable_web_page_preview: true,
-    message_thread_id: TOPIC_ID
   };
 
   try {
     await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
   } catch (err) {
     console.error("Telegram Error:", err);
   }
 }
 
-// --------------------------------------------------------
-// WebSocket Provider (with auto-reconnect protection)
-// --------------------------------------------------------
+// ------------------------------
+// WS PROVIDER (ETHERS v6 SAFE)
+// ------------------------------
 let provider;
 
 function startProvider() {
   console.log("Connecting to Base RPC via WebSocket…");
 
   provider = new ethers.WebSocketProvider(RPC_WSS);
+  const ws = provider.websocket;
 
-  provider._websocket.on("close", () => {
-    console.error("WebSocket closed → reconnecting in 3 seconds…");
+  ws.addEventListener("close", () => {
+    console.error("WebSocket closed — reconnecting in 3 seconds…");
     setTimeout(startProvider, 3000);
   });
 
-  provider._websocket.on("error", (err) => {
+  ws.addEventListener("error", (err) => {
     console.error("WebSocket error:", err);
-    provider._websocket.close();
+    try { ws.close(); } catch {}
   });
 
   attachListeners();
@@ -78,12 +80,12 @@ function startProvider() {
 
 startProvider();
 
-// --------------------------------------------------------
-// Governance Contract + Events
-// --------------------------------------------------------
+// ------------------------------
+// GOVERNANCE CONTRACT + EVENTS
+// ------------------------------
 const ABI = [
   "event ProposalCreated(uint256 proposalId, address proposer, address target, bytes data, uint256 start, uint256 end, string description)",
-  "event ProposalExecuted(uint256 proposalId)"
+  "event ProposalExecuted(uint256 proposalId)",
 ];
 
 let gov;
@@ -91,9 +93,11 @@ let gov;
 function attachListeners() {
   gov = new ethers.Contract(GOVERNANCE, ABI, provider);
 
-  // Track proposals for polling
   const tracked = new Map();
 
+  // ------------------------------
+  // VOTING START / END POLLING
+  // ------------------------------
   function startVoteWatchers(proposalId, startBlock, endBlock, desc) {
     const idStr = proposalId.toString();
 
@@ -103,7 +107,7 @@ function attachListeners() {
         endBlock: Number(endBlock),
         startedSent: false,
         endedSent: false,
-        desc
+        desc,
       });
     }
 
@@ -121,8 +125,8 @@ function attachListeners() {
           await sendTelegram(
             `✅ *Voting Started*\n` +
             `*Proposal ID:* ${idStr}\n` +
-            `*Block:* ${t.startBlock}\n` +
-            `*Time:* ${ukTime()} (UK Time)\n\n` +
+            `*Start Block:* ${t.startBlock}\n` +
+            `*Time:* ${ukTime()} (UK)\n\n` +
             `*Description:*\n${t.desc}`
           );
         }
@@ -135,8 +139,8 @@ function attachListeners() {
           await sendTelegram(
             `🛑 *Voting Ended*\n` +
             `*Proposal ID:* ${idStr}\n` +
-            `*Block:* ${t.endBlock}\n` +
-            `*Time:* ${ukTime()} (UK Time)\n\n` +
+            `*End Block:* ${t.endBlock}\n` +
+            `*Time:* ${ukTime()} (UK)\n\n` +
             `*Description:*\n${t.desc}`
           );
 
@@ -148,36 +152,39 @@ function attachListeners() {
     }, 30_000);
   }
 
-  // --------------------------------------------------------
-  // Event Listener: Proposal Created
-  // --------------------------------------------------------
-  gov.on("ProposalCreated", async (id, proposer, target, data, start, end, desc) => {
-    console.log(`[SSR] ProposalCreated → ${id.toString()}`);
+  // ------------------------------
+  // EVENT: Proposal Created
+  // ------------------------------
+  gov.on(
+    "ProposalCreated",
+    async (id, proposer, target, data, start, end, desc) => {
+      console.log(`[SSR] ProposalCreated → ${id.toString()}`);
 
-    await sendTelegram(
-      `🗳 *New Proposal Created*\n` +
-      `*Proposal ID:* ${id.toString()}\n` +
-      `*Proposer:* \`${proposer}\`\n` +
-      `*Target:* \`${target}\`\n` +
-      `*Start Block:* ${start}\n` +
-      `*End Block:* ${end}\n` +
-      `*Time Created:* ${ukTime()} (UK Time)\n\n` +
-      `*Description:*\n${desc}`
-    );
+      await sendTelegram(
+        `🗳 *New Proposal Created*\n` +
+        `*Proposal ID:* ${id.toString()}\n` +
+        `*Proposer:* \`${proposer}\`\n` +
+        `*Target:* \`${target}\`\n` +
+        `*Start Block:* ${start}\n` +
+        `*End Block:* ${end}\n` +
+        `*Time:* ${ukTime()} (UK)\n\n` +
+        `*Description:*\n${desc}`
+      );
 
-    startVoteWatchers(id, start, end, desc);
-  });
+      startVoteWatchers(id, start, end, desc);
+    }
+  );
 
-  // --------------------------------------------------------
-  // Event Listener: Proposal Executed
-  // --------------------------------------------------------
+  // ------------------------------
+  // EVENT: Proposal Executed
+  // ------------------------------
   gov.on("ProposalExecuted", async (id) => {
     console.log(`[SSR] ProposalExecuted → ${id.toString()}`);
 
     await sendTelegram(
       `🎉 *Proposal Executed*\n` +
       `*Proposal ID:* ${id.toString()}\n` +
-      `*Time:* ${ukTime()} (UK Time)`
+      `*Time:* ${ukTime()} (UK)`
     );
   });
 }
